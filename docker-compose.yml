@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: cicd_db
+    restart: always
+    environment:
+      POSTGRES_USER: cicd_user
+      POSTGRES_PASSWORD: cicd_password
+      POSTGRES_DB: cicd_monitor
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - cicd_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cicd_backend
+    restart: always
+    environment:
+      PROJECT_NAME: "CI/CD Monitor API"
+      DATABASE_URL: "postgresql+asyncpg://cicd_user:cicd_password@db:5432/cicd_monitor"
+      SECRET_KEY: "temporary_jwt_secret_key_change_in_production_keep_it_safe"
+      ALGORITHM: "HS256"
+      ACCESS_TOKEN_EXPIRE_MINUTES: "1440"
+      ENCRYPTION_KEY: "LFZKetsvW4Nq2ePhMf7KhFi1xzK-391SfJdEeNfXw3Y="
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    networks:
+      - cicd_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cicd_frontend
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - cicd_network
+
+volumes:
+  pgdata:
+
+networks:
+  cicd_network:
+    driver: bridge
