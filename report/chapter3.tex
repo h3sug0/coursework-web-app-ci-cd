@@ -1,0 +1,218 @@
+\section*{Глава 3. Разработка веб-приложения}
+\addcontentsline{toc}{section}{Глава 3. Разработка веб-приложения}
+\stepcounter{section}
+
+\subsection{Разработка базовой структуры приложения и шаблонов страниц}
+
+В соответствии с выбранным стеком архитектура разрабатываемого программного комплекса построена по принципу разделения клиентской части (SPA на React) и серверного интерфейса (REST API на FastAPI).
+
+Исходный код системы организован в рамках единого репозитория с четким разграничением уровней ответственности:
+\begin{itemize}
+    \item \texttt{backend/} --- серверная часть на языке Python:
+    \begin{itemize}
+        \item \texttt{app/core/} --- глобальные параметры конфигурации, настройки безопасности и подключение к СУБД;
+        \item \texttt{app/models/} --- декларативные ORM-модели базы данных (SQLAlchemy 2.0);
+        \item \texttt{app/schemas/} --- схемы валидации и сериализации входящих и исходящих данных (Pydantic v2);
+        \item \texttt{app/services/} --- слой бизнес-логики: адаптеры внешних CI/CD API (GitHub, GitLab), сервис шифрования токенов и модуль диспетчеризации;
+        \item \texttt{app/api/v1/} --- модули маршрутизации HTTP-запросов (контроллеры эндпоинтов).
+    \end{itemize}
+    \item \texttt{frontend/} --- клиентское приложение на React:
+    \begin{itemize}
+        \item \texttt{src/components/} --- атомарные компоненты интерфейса (кнопки, индикаторы статусов, модальные окна, терминал логов);
+        \item \texttt{src/pages/} --- экранные формы приложения (страницы авторизации, главного дашборда, настроек интеграций, детальной аналитики сборок);
+        \item \texttt{src/services/} --- клиенты взаимодействия с API на базе Axios с перехватчиками (interceptors) сетевых ответов;
+        \item \texttt{src/context/} --- состояние приложения (глобальный контекст авторизации и профиля пользователя).
+    \end{itemize}
+\end{itemize}
+
+Маршрутизация на стороне клиента реализована с использованием библиотеки \texttt{react-router-dom}. Все защищенные экраны обернуты в компонент \texttt{ProtectedRoute}, который проверяет валидность токена сессии и выполняет перенаправление на страницу входа при его отсутствии.
+
+Базовый каркас интерфейса (\texttt{MainLayout}) включает в себя адаптивную боковую панель навигации (Sidebar), верхнюю строку состояния с информацией о пользователе и центральную контентную область. Стилизация выполнена с использованием утилитарного CSS-фреймворка Tailwind CSS, что обеспечивает консистентный дизайн и адаптивность под различные разрешения экрана.
+
+\subsection{Реализация аутентификации и авторизации пользователей}
+
+Безопасность системы обеспечивается механизмом аутентификации на основе токенов стандарта JWT (JSON Web Token, RFC~7519) в сочетании с алгоритмом хеширования паролей bcrypt.
+
+\subsubsection{Серверная логика безопасности}
+При регистрации пользователя введенный пароль не сохраняется в открытом виде, а обрабатывается криптографической функцией хеширования с добавлением соли через библиотеку \texttt{passlib}. Для генерации цифровой подписи токенов применяется алгоритм HMAC-SHA256 с использованием закрытого серверного ключа.
+
+Схема реализации внедрения зависимостей (Dependency Injection) для защиты закрытых эндпоинтов в FastAPI представлена в листинге~\ref{lst:auth_dep}.
+
+\begin{figure}[H]
+\centering
+\begin{minipage}{0.95\textwidth}
+\footnotesize
+\begin{verbatim}
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from sqlalchemy.ext.asyncio import AsyncSession
+
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="/api/v1/auth/login"
+)
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Не удалось подтвердить учетные данные",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(
+            token, SECRET_KEY, algorithms=[ALGORITHM]
+        )
+        user_id: int = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = await db.get(User, int(user_id))
+    if user is None or not user.is_active:
+        raise credentials_exception
+    return user
+\end{verbatim}
+\end{minipage}
+\caption{Реализация зависимости проверки JWT-токена в FastAPI}
+\label{lst:auth_dep}
+\end{figure}
+
+\subsubsection{Клиентская интеграция аутентификации}
+На стороне SPA-клиента полученный JWT-токен сохраняется в защищенном хранилище браузера (\texttt{localStorage}). Для взаимодействия с сервером настроен экземпляр Axios, который автоматически подставляет заголовок \texttt{Authorization: Bearer <token>} во все исходящие запросы. При получении HTTP-ответа со статусом 401 (Unauthorized) перехватчик сбрасывает сессию и перенаправляет пользователя на форму входа.
+
+\subsection{Реализация CRUD-интерфейса для управления пайплайнами и этапами выполнения}
+
+Для организации мониторинга пользователь настраивает подключение к целевым Git-платформам и выбирает репозитории для отслеживания.
+
+\subsubsection{Шифрование конфиденциальных данных}
+Персональные токены доступа (GitHub PAT, GitLab Token) представляют собой критически важные учетные данные. Сохранение их в открытом виде недопустимо. В модуле \texttt{security.py} реализован алгоритм симметричного шифрования Fernet (на базе AES-128 в режиме CBC с аутентификацией HMAC), представленный в листинге~\ref{lst:fernet_crypto}.
+
+\begin{figure}[H]
+\centering
+\begin{minipage}{0.95\textwidth}
+\footnotesize
+\begin{verbatim}
+from cryptography.fernet import Fernet
+from app.core.config import settings
+
+cipher = Fernet(settings.ENCRYPTION_KEY.encode())
+
+def encrypt_token(plain_token: str) -> str:
+    return cipher.encrypt(plain_token.encode()).decode()
+
+def decrypt_token(encrypted_token: str) -> str:
+    return cipher.decrypt(encrypted_token.encode()).decode()
+\end{verbatim}
+\end{minipage}
+\caption{Функции шифрования и дешифрования токенов внешних провайдеров}
+\label{lst:fernet_crypto}
+\end{figure}
+
+\subsubsection{Спецификация маршрутов REST API}
+Для управления сущностями разработаны программные эндпоинты, спецификация которых приведена в таблице~\ref{tab:api_endpoints}.
+
+\begin{table}[H]
+    \centering
+    \caption{Спецификация эндпоинтов управления (префикс \texttt{/api/v1})}
+    \label{tab:api_endpoints}
+    \small
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{|l|l|p{8.5cm}|}
+        \hline
+        \textbf{Метод} & \textbf{Маршрут} & \textbf{Назначение операции} \\ \hline
+        \texttt{POST} & \texttt{/auth/login} & Аутентификация пользователя и выпуск JWT \\ \hline
+        \texttt{GET} & \texttt{/providers} & Получение списка подключенных провайдеров \\ \hline
+        \texttt{POST} & \texttt{/providers} & Подключение провайдера (с шифрованием токена) \\ \hline
+        \texttt{DELETE} & \texttt{/providers/\{id\}} & Удаление интеграции и связанных репозиториев \\ \hline
+        \texttt{GET} & \texttt{/repositories} & Список отслеживаемых репозиториев с фильтрацией \\ \hline
+        \texttt{POST} & \texttt{/repositories/sync} & Синхронизация списка репозиториев из внешнего API \\ \hline
+        \texttt{PATCH} & \texttt{/repositories/\{id\}} & Переключение флага мониторинга (\texttt{is\_monitored}) \\ \hline
+    \end{tabular}%
+    }
+\end{table}
+
+На клиентской стороне разработан интерфейс настроек (\texttt{SettingsPage}), позволяющий в интерактивном режиме вводить токены провайдеров, проверять соединение с внешним API и включать отслеживание необходимых проектов с помощью переключателей (Toggle Switch).
+
+\subsection{Реализация системы запуска, мониторинга и отображения статусов CI/CD-пайплайнов}
+
+\subsubsection{Асинхронные адаптеры интеграции}
+Для взаимодействия с внешними системами автоматизации разработан сервисный уровень с базовым интерфейсом \texttt{BaseCIAdapter}. За счет этого архитектура приложения не зависит от конкретной платформы.
+
+Реализация адаптера для GitHub Actions использует клиент \texttt{httpx.AsyncClient} с пулом соединений. Фрагмент кода отправки команды на повторный запуск конвейера (Re-run) приведен в листинге~\ref{lst:github_rerun}.
+
+\begin{figure}[H]
+\centering
+\begin{minipage}{0.95\textwidth}
+\footnotesize
+\begin{verbatim}
+import httpx
+from fastapi import HTTPException
+
+class GitHubAdapter:
+    def __init__(
+        self,
+        token: str,
+        base_url: str = "https://api.github.com"
+    ):
+        self.base_url = base_url
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+
+    async def rerun_workflow(
+        self,
+        repo_full_name: str,
+        run_id: str
+    ) -> bool:
+        url = (
+            f"{self.base_url}/repos/{repo_full_name}"
+            f"/actions/runs/{run_id}/rerun"
+        )
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, headers=self.headers)
+            if resp.status_code == 201:
+                return True
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Ошибка внешнего API: {resp.text}"
+            )
+\end{verbatim}
+\end{minipage}
+\caption{Асинхронный метод перезапуска пайплайна через GitHub Actions API}
+\label{lst:github_rerun}
+\end{figure}
+
+\subsubsection{Отображение состояния сборок на клиентской части}
+Главный экран мониторинга (\texttt{DashboardPage}) агрегирует данные обо всех активных пайплайнах. Статусы сборок нормализуются к единому формату перечисления (\texttt{QUEUED}, \texttt{RUNNING}, \texttt{SUCCESS}, \texttt{FAILED}, \texttt{CANCELED}) вне зависимости от исходного провайдера.
+
+Каждая карточка содержит визуальные индикаторы:
+\begin{itemize}
+    \item зеленый индикатор --- конвейер выполнен успешно;
+    \item красный пульсирующий бейдж --- зафиксирована ошибка выполнения стадии;
+    \item синий анимированный индикатор --- пайплайн находится в процессе выполнения;
+    \item контекстная кнопка действия «Re-run» --- активна для упавших или отмененных сборок. При нажатии вызывается мутация данных через REST API, а статус немедленно переходит в состояние ожидания запуска.
+\end{itemize}
+
+\subsection{Реализация системы логирования, хранения и обработки данных запусков}
+
+\subsubsection{Сбор и нормализация журналов выполнения}
+При обнаружении сбоя в работе конвейера система выполняет запрос к внешнему API для получения вывода консоли упавшего шага. Ввиду того, что полный объем журналов сборки может достигать десятков мегабайт, в базе данных PostgreSQL сохраняется только информативный срез (последние 200 строк вывода ошибки, извлекаемые регулярными выражениями по ключевым маркерам \texttt{ERROR}, \texttt{FATAL}, \texttt{FAILED}).
+
+На фронтенде для отображения журналов разработан компонент \texttt{LogViewer}. Он использует моноширинный шрифт, темную цветовую схему и поддерживает автоматическую прокрутку к месту возникновения критической ошибки.
+
+\subsubsection{Агрегация и визуализация аналитических метрик}
+Для оценки эффективности процессов непрерывной интеграции реализован контроллер аналитики \texttt{/api/v1/metrics/summary}. Сервис агрегирует исторические записи из таблицы \texttt{pipelines} с применением математических функций PostgreSQL:
+\begin{equation}
+    \text{Success Rate} = \frac{N_{\text{success}}}{N_{\text{total}}} \times 100\%,
+\end{equation}
+где $N_{\text{success}}$ --- количество успешно завершенных сборок за выбранный период, $N_{\text{total}}$ --- общее число запусков конвейеров.
+
+На клиентской стороне вычисленные показатели отображаются в виде обзорных карточек метрик (KPI widgets) и временных графиков, позволяющих отслеживать среднюю продолжительность сборки и динамику процента падений по дням недели.
+
+Разработанный программный комплекс полностью реализует поставленные функциональные требования, формируя надежный и удобный инструмент централизованного мониторинга сборок.
